@@ -1,159 +1,90 @@
 
+/**
+ * NetOps Command Finder - Cloudflare Worker
+ * Uses Tavily search + Cloudflare Workers AI.
+ * Required: AI binding and TAVILY_KEY secret.
+ */
 const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 const DEFAULT_ALLOWED_ORIGINS = ["https://esllammohsen.github.io"];
 
 const VENDORS = {
-  f5: {
-    label: "F5 BIG-IP / TMOS",
-    domains: ["my.f5.com", "clouddocs.f5.com", "techdocs.f5.com", "support.f5.com"]
-  },
-  cisco: {
-    label: "Cisco",
-    domains: ["cisco.com", "developer.cisco.com"]
-  },
-  paloalto: {
-    label: "Palo Alto Networks",
-    domains: ["docs.paloaltonetworks.com", "knowledgebase.paloaltonetworks.com"]
-  },
-  fortinet: {
-    label: "Fortinet",
-    domains: ["docs.fortinet.com", "community.fortinet.com"]
-  },
-  generic: {
-    label: "Network and security infrastructure",
-    domains: [
-      "cisco.com", "developer.cisco.com",
-      "my.f5.com", "clouddocs.f5.com", "techdocs.f5.com", "support.f5.com",
-      "docs.paloaltonetworks.com", "knowledgebase.paloaltonetworks.com",
-      "docs.fortinet.com", "community.fortinet.com"
-    ]
-  }
+  f5: { label: "F5 BIG-IP / TMOS", domains: ["my.f5.com", "clouddocs.f5.com", "techdocs.f5.com", "support.f5.com"] },
+  cisco: { label: "Cisco network and security products", domains: ["cisco.com", "developer.cisco.com"] },
+  paloalto: { label: "Palo Alto Networks PAN-OS", domains: ["docs.paloaltonetworks.com", "knowledgebase.paloaltonetworks.com"] },
+  fortinet: { label: "Fortinet FortiGate / FortiOS", domains: ["docs.fortinet.com", "community.fortinet.com"] },
+  generic: { label: "Network and security infrastructure", domains: ["cisco.com", "developer.cisco.com", "my.f5.com", "clouddocs.f5.com", "techdocs.f5.com", "support.f5.com", "docs.paloaltonetworks.com", "knowledgebase.paloaltonetworks.com", "docs.fortinet.com", "community.fortinet.com"] }
 };
 
-const SYSTEM_PROMPT = `
-You are a senior network and security engineer.
+const SYSTEM_PROMPT = `You are a network and security infrastructure research assistant. Use ONLY the supplied search results.
+Return JSON with exactly these fields: summary, causes, commands, sources, safety_note.
+Each cause MUST include title, detail, source_url, evidence_quote. The quote must be copied verbatim from that source's supplied content and directly support the cause. If no direct evidence exists, omit the cause.
+Each command MUST include command, platform, description, when_to_use, risk, source_title, source_url. Only return a command if its exact syntax appears in supplied source content AND that content supports the stated purpose. Do not invent or infer commands, flags, paths, or CLI context. Distinguish vendor CLI from Linux shell. Never provide commands that reveal, copy, export, or print private keys. Prefer read-only commands. Mark changes and disruptive actions accurately.
+Sources must be selected from supplied results only. Do not treat a vendor domain as proof of relevance. Exclude generic labs and unrelated pages. If evidence is insufficient, return empty causes and commands and state that clearly. Do not claim version compatibility unless the evidence explicitly supports it. Output valid JSON only.`;
 
-Use ONLY the supplied search evidence.
-Answer the user's exact technical question.
-
-STRICT RULES:
-1. Match the exact vendor, product, feature and task.
-2. Do not treat a vendor domain as proof that a page is relevant.
-3. Exclude generic labs, unrelated products and unrelated tutorials.
-4. Never invent commands, flags, paths or syntax.
-5. Only suggest commands directly supported by the supplied source content.
-6. Distinguish Linux shell commands from vendor CLI commands.
-7. Never suggest displaying, copying, exporting or exposing private keys.
-8. Prefer read-only diagnostic commands.
-9. Clearly identify configuration-changing and disruptive commands.
-10. If evidence is insufficient, return an empty commands array.
-11. Do not claim that a command verifies something unless the source supports that exact purpose.
-12. Do not assume a command is valid for a requested software version unless the evidence supports it.
-
-Return ONLY valid JSON:
-{
- "summary":"Answer",
- "causes":[{"title":"Cause","detail":"Explanation"}],
- "commands":[
-  {
-   "command":"Exact command",
-   "platform":"Platform and CLI context",
-   "description":"Purpose",
-   "when_to_use":"When to use",
-   "risk":"Read-only",
-   "source_title":"Exact source title",
-   "source_url":"Exact source URL"
-  }
- ],
- "sources":[{"title":"Source title","url":"Exact URL"}],
- "safety_note":"Safety note"
-}
-
-Do not use Markdown fences.
-`;
-
-function response(data, status, headers) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      ...headers
-    }
-  });
-}
-
-function getCors(origin, allowed) {
-  const valid = allowed.includes("*") || allowed.includes(origin);
+function corsHeaders(origin, allowed) {
+  const ok = allowed.includes("*") || allowed.includes(origin);
   return {
-    "Access-Control-Allow-Origin": valid
-      ? (allowed.includes("*") ? "*" : origin)
-      : "null",
+    "Access-Control-Allow-Origin": ok ? (allowed.includes("*") ? "*" : origin) : "null",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
     "Vary": "Origin"
   };
 }
 
+function jsonResponse(data, status, headers) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8", ...headers }
+  });
+}
+
 function detectVendor(vendor, query) {
-  const text = `${vendor} ${query}`.toLowerCase();
-
-  if (/\bf5\b|big-?ip|tmsh|\bawaf\b|\basm\b|\bltm\b/.test(text)) return "f5";
-  if (/cisco|\bftd\b|\bfmc\b|\basa\b|catalyst/.test(text)) return "cisco";
-  if (/palo\s*alto|pan-os|panorama/.test(text)) return "paloalto";
-  if (/fortinet|fortigate|fortimanager|fortios/.test(text)) return "fortinet";
-
+  const t = `${vendor} ${query}`.toLowerCase();
+  if (/\bf5\b|big-?ip|tmsh|\bawaf\b|\basm\b|\bltm\b/.test(t)) return "f5";
+  if (/cisco|\bftd\b|\bfmc\b|\basa\b|catalyst/.test(t)) return "cisco";
+  if (/palo\s*alto|pan-os|panorama/.test(t)) return "paloalto";
+  if (/fortinet|fortigate|fortimanager|fortios/.test(t)) return "fortinet";
   return "generic";
 }
 
 function extractVersion(text) {
-  const match = String(text).match(
-    /\b(?:BIG-IP|TMOS|PAN-OS|FortiOS|FTD|FMC)?\s*v?(\d{1,2}\.\d{1,2}(?:\.\d{1,2})?)\b/i
-  );
-  return match ? match[1] : "";
+  const m = String(text).match(/\b(?:BIG-IP|TMOS|PAN-OS|FortiOS|FTD|FMC)\s*v?(\d{1,2}\.\d{1,2}(?:\.\d{1,2})?)\b/i);
+  return m ? m[1] : "";
 }
 
-function buildQueries(vendorKey, vendor, query) {
-  const config = VENDORS[vendorKey];
+function buildQueries(key, vendor, query) {
   const version = extractVersion(query);
-  const versionText = version ? `version ${version}` : "";
+  const v = version ? `version ${version}` : "";
   const q = query.replace(/\s+/g, " ").trim();
 
-  if (vendorKey === "f5") {
-    return [
-      `F5 BIG-IP ${versionText} ${q} official technical documentation`,
-      `F5 BIG-IP ${versionText} ${q} TMSH command reference`,
-      `site:clouddocs.f5.com BIG-IP ${versionText} ${q}`
-    ];
-  }
+  if (key === "f5") return [
+    `F5 BIG-IP ${v} ${q} official documentation`,
+    `F5 BIG-IP ${v} ${q} command reference TMSH`,
+    `site:clouddocs.f5.com BIG-IP ${v} ${q}`
+  ];
 
-  if (vendorKey === "cisco") {
-    return [
-      `Cisco ${versionText} ${q} official documentation`,
-      `Cisco ${versionText} ${q} CLI command reference`,
-      `site:cisco.com ${versionText} ${q}`
-    ];
-  }
+  if (key === "cisco") return [
+    `Cisco ${v} ${q} official documentation`,
+    `Cisco ${v} ${q} CLI command reference`,
+    `site:cisco.com ${v} ${q}`
+  ];
 
-  if (vendorKey === "paloalto") {
-    return [
-      `Palo Alto PAN-OS ${versionText} ${q} official documentation`,
-      `PAN-OS ${versionText} ${q} CLI command reference`,
-      `site:docs.paloaltonetworks.com ${versionText} ${q}`
-    ];
-  }
+  if (key === "paloalto") return [
+    `Palo Alto PAN-OS ${v} ${q} official documentation`,
+    `PAN-OS ${v} ${q} CLI command reference`,
+    `site:docs.paloaltonetworks.com ${v} ${q}`
+  ];
 
-  if (vendorKey === "fortinet") {
-    return [
-      `Fortinet FortiOS ${versionText} ${q} official documentation`,
-      `FortiGate ${versionText} ${q} CLI command reference`,
-      `site:docs.fortinet.com ${versionText} ${q}`
-    ];
-  }
+  if (key === "fortinet") return [
+    `Fortinet FortiOS ${v} ${q} official documentation`,
+    `FortiGate ${v} ${q} CLI command reference`,
+    `site:docs.fortinet.com ${v} ${q}`
+  ];
 
   return [
-    `${vendor} ${q} official vendor documentation`,
+    `${vendor} ${q} official documentation`,
     `${vendor} ${q} CLI command reference`,
-    `${q} network security troubleshooting official documentation`
+    `${q} network security troubleshooting documentation`
   ];
 }
 
@@ -176,125 +107,93 @@ async function tavilySearch(apiKey, query, domains) {
   const data = await res.json().catch(() => ({}));
 
   if (!res.ok) {
-    throw new Error(
-      data?.detail?.error || data?.error || `Tavily HTTP ${res.status}`
-    );
+    throw new Error(data?.detail?.error || data?.error || `Tavily HTTP ${res.status}`);
   }
 
   return Array.isArray(data.results) ? data.results : [];
 }
 
-function normalizeText(value) {
-  return String(value || "")
+function normalizeText(s) {
+  return String(s || "")
     .toLowerCase()
-    .replace(/https?:\/\/\S+/g, " ")
-    .replace(/[^a-z0-9.+/#_-]+/g, " ")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&gt;/g, ">")
+    .replace(/&lt;/g, "<")
+    .replace(/&amp;/g, "&")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function getTokens(value) {
-  const stopWords = new Set([
+function isIrrelevantPage(item) {
+  const t = normalizeText(`${item.title} ${item.content.slice(0, 500)}`);
+  return /\blab\s*\d+\b|hands.on lab|virtual lab|exam preparation|course overview|training course/.test(t);
+}
+
+function relevance(item, query) {
+  if (isIrrelevantPage(item)) return 0;
+
+  const content = normalizeText(`${item.title} ${item.content}`);
+  const stop = new Set([
     "the", "and", "for", "with", "from", "that", "this",
     "how", "what", "when", "where", "are", "is", "on",
-    "in", "to", "of", "a", "an", "using", "use", "check"
+    "in", "to", "of", "a", "an", "using", "use", "check", "verify"
   ]);
 
-  return normalizeText(value)
-    .split(" ")
-    .filter(word => word.length > 2 && !stopWords.has(word));
+  const terms = [...new Set(
+    normalizeText(query)
+      .split(/[^a-z0-9.+#_-]+/)
+      .filter(x => x.length > 2 && !stop.has(x))
+  )];
+
+  if (!terms.length) return 0;
+
+  const matched = terms.filter(x => content.includes(x)).length;
+  return matched / terms.length;
 }
 
-function isBadPage(result) {
-  const title = normalizeText(result.title);
-  const content = normalizeText(result.content);
-
-  const badPatterns = [
-    /\blab\s+\d+\b/,
-    /\bhands on lab\b/,
-    /\bvirtual lab\b/,
-    /\btraining course\b/,
-    /\bcourse overview\b/,
-    /\bexam preparation\b/
-  ];
-
-  return badPatterns.some(pattern =>
-    pattern.test(title) || pattern.test(content.slice(0, 250))
-  );
-}
-
-function scoreRelevance(result, query, vendorKey) {
-  if (isBadPage(result)) return 0;
-
-  const text = normalizeText(
-    `${result.title} ${result.content}`
-  );
-
-  const tokens = [...new Set(getTokens(query))];
-
-  if (!tokens.length) return 0;
-
-  let matched = 0;
-  for (const token of tokens) {
-    if (text.includes(token)) matched++;
-  }
-
-  let score = matched / tokens.length;
-
-  const title = normalizeText(result.title);
-
-  if (vendorKey === "f5" && (
-    title.includes("big ip") ||
-    title.includes("tmos") ||
-    title.includes("client ssl") ||
-    title.includes("ssl profile")
-  )) {
-    score += 0.2;
-  }
-
-  if (
-    title.includes("command reference") ||
-    title.includes("configuration guide") ||
-    title.includes("administration guide")
-  ) {
-    score += 0.1;
-  }
-
-  return Math.min(score, 1);
-}
-
-function normalizeResults(items, query, vendorKey) {
+function normalizeResults(items, query) {
   const seen = new Set();
-  const results = [];
+  const out = [];
 
-  for (const item of items) {
-    const url = String(item?.url || "").trim();
-    const content = String(item?.content || "").trim();
+  for (const x of items) {
+    const url = String(x?.url || "").trim();
+    const content = String(x?.content || "").trim();
 
-    if (!/^https:\/\//i.test(url)) continue;
-    if (content.length < 30) continue;
-    if (seen.has(url)) continue;
+    if (!/^https:\/\//i.test(url) || content.length < 35 || seen.has(url)) continue;
 
-    seen.add(url);
+    let host;
+    try {
+      host = new URL(url).hostname.toLowerCase();
+    } catch {
+      continue;
+    }
 
-    const result = {
-      title: String(item.title || "Untitled source").slice(0, 250),
+    const approvedHost = Object.values(VENDORS).some(v =>
+      v.domains.some(d => host === d || host.endsWith(`.${d}`))
+    );
+
+    if (!approvedHost) continue;
+
+    const item = {
+      title: String(x.title || "Untitled source").slice(0, 250),
       url,
-      content: content.slice(0, 2500),
-      originalScore: Number(item.score || 0)
+      content: content.slice(0, 3000),
+      score: Number(x.score || 0)
     };
 
-    result.relevance = scoreRelevance(result, query, vendorKey);
+    item.relevance = relevance(item, query);
 
-    if (result.relevance >= 0.25) {
-      results.push(result);
+    if (item.relevance >= 0.20) {
+      seen.add(url);
+      out.push(item);
     }
   }
 
-  return results
+  return out
     .sort((a, b) =>
-      (b.relevance + b.originalScore * 0.1) -
-      (a.relevance + a.originalScore * 0.1)
+      (b.relevance + b.score * 0.1) -
+      (a.relevance + a.score * 0.1)
     )
     .slice(0, 10);
 }
@@ -302,63 +201,48 @@ function normalizeResults(items, query, vendorKey) {
 function parseAI(output) {
   if (output && typeof output === "object") return output;
 
-  if (typeof output !== "string" || !output.trim()) {
-    throw new Error("Empty AI response");
-  }
-
-  const cleaned = output.trim()
+  const s = String(output || "")
+    .trim()
     .replace(/^```json\s*/i, "")
     .replace(/^```\s*/i, "")
     .replace(/\s*```$/i, "");
 
   try {
-    return JSON.parse(cleaned);
-  } catch (_) {
-    const first = cleaned.indexOf("{");
-    const last = cleaned.lastIndexOf("}");
+    return JSON.parse(s);
+  } catch {
+    const a = s.indexOf("{");
+    const b = s.lastIndexOf("}");
 
-    if (first >= 0 && last > first) {
-      return JSON.parse(cleaned.slice(first, last + 1));
-    }
-
-    throw new Error("Invalid AI JSON response");
+    if (a >= 0 && b > a) return JSON.parse(s.slice(a, b + 1));
+    throw new Error("AI response is not valid JSON");
   }
 }
 
-// Strict check: the command itself must appear in the source content.
-// This intentionally rejects commands that AI inferred or invented.
-function commandAppearsInSource(command, source) {
-  const normalizedCommand = normalizeText(command);
-  const normalizedContent = normalizeText(source.content);
-
-  if (normalizedCommand.length < 8) return false;
-
-  return normalizedContent.includes(normalizedCommand);
+function commandIsSensitive(command) {
+  return /\b(private.?key|key.?file|certificate_key_d)\b/i.test(command) &&
+    /\b(cat|type|more|less|copy|cp|export|show|list|print|dump)\b/i.test(command);
 }
 
-function isSensitiveCommand(command) {
-  const text = String(command || "").toLowerCase();
-
-  const patterns = [
-    /\bcat\b.*\b(key|private)\b/,
-    /\bshow\b.*\bprivate[- ]key\b/,
-    /\bexport\b.*\bprivate[- ]key\b/,
-    /\bcopy\b.*\bprivate[- ]key\b/,
-    /certificate_key_d/,
-    /privatekey/
-  ];
-
-  return patterns.some(pattern => pattern.test(text));
+function commandIsInSource(command, source) {
+  const c = normalizeText(command);
+  const s = normalizeText(source.content);
+  return c.length >= 8 && s.includes(c);
 }
 
-function safeRisk(value) {
-  const risk = String(value || "").toLowerCase();
+function quoteIsInSource(quote, source) {
+  const q = normalizeText(quote);
+  const s = normalizeText(source.content);
+  return q.length >= 25 && s.includes(q);
+}
 
-  if (/disrupt|restart|reload|delete|remove|replace|modify|install|import|change/.test(risk)) {
+function riskLabel(value, command) {
+  const text = `${value || ""} ${command || ""}`.toLowerCase();
+
+  if (/\b(restart|reboot|reload|delete|remove|replace|force-full-load-push|clear|flush)\b/.test(text)) {
     return "Potentially disruptive";
   }
 
-  if (/config|write|set|create|update/.test(risk)) {
+  if (/\b(modify|install|import|create|set|save|enable|disable|export)\b/.test(text)) {
     return "Changes configuration";
   }
 
@@ -366,69 +250,62 @@ function safeRisk(value) {
 }
 
 function normalizeAIData(data, results) {
-  const emptyResult = {
-    summary: "The search results did not provide enough relevant evidence to verify commands for this question.",
-    causes: [],
-    commands: [],
-    sources: [],
-    safety_note: "No Internet commands are presented because the available sources did not sufficiently support them. Verify against the official documentation for your exact product and version."
-  };
-
-  if (!data || typeof data !== "object" || Array.isArray(data)) {
-    return emptyResult;
-  }
-
   const byUrl = new Map(results.map(r => [r.url, r]));
 
-  const selectedSources = Array.isArray(data.sources)
-    ? data.sources
-        .filter(s => s && byUrl.has(s.url))
-        .map(s => byUrl.get(s.url))
-    : [];
-
-  const uniqueSources = [
-    ...new Map(selectedSources.map(s => [s.url, s])).values()
-  ];
-
-  const sourceUrls = new Set(uniqueSources.map(s => s.url));
-
-  const commands = (Array.isArray(data.commands) ? data.commands : [])
-    .slice(0, 10)
+  const acceptedCauses = (Array.isArray(data?.causes) ? data.causes : [])
     .filter(c => {
-      if (!c || typeof c.command !== "string") return false;
-      if (isSensitiveCommand(c.command)) return false;
-      if (!sourceUrls.has(c.source_url)) return false;
-
-      const source = byUrl.get(c.source_url);
-      return source && commandAppearsInSource(c.command, source);
+      const source = byUrl.get(c?.source_url);
+      return source && quoteIsInSource(c.evidence_quote, source);
     })
+    .slice(0, 6);
+
+  const causes = acceptedCauses.map(c => ({
+    title: String(c.title || ""),
+    detail: String(c.detail || "")
+  }));
+
+  const commands = (Array.isArray(data?.commands) ? data.commands : [])
+    .filter(c => {
+      const source = byUrl.get(c?.source_url);
+
+      return source &&
+        typeof c.command === "string" &&
+        !commandIsSensitive(c.command) &&
+        commandIsInSource(c.command, source);
+    })
+    .slice(0, 10)
     .map(c => ({
       command: c.command,
       platform: String(c.platform || ""),
       description: String(c.description || ""),
       when_to_use: String(c.when_to_use || ""),
-      risk: safeRisk(c.risk),
+      risk: riskLabel(c.risk, c.command),
       source_title: byUrl.get(c.source_url).title,
       source_url: c.source_url
     }));
 
-  const verifiedSources = commands.length
-    ? uniqueSources
-    : [];
+  const acceptedUrls = new Set([
+    ...acceptedCauses.map(c => c.source_url).filter(Boolean),
+    ...commands.map(c => c.source_url).filter(Boolean)
+  ]);
+
+  const sources = [...acceptedUrls].map(url => ({
+    title: byUrl.get(url).title,
+    url
+  }));
+
+  const hasEvidence = causes.length > 0 || commands.length > 0;
 
   return {
-    summary: commands.length
+    summary: hasEvidence
       ? String(data.summary || "")
-      : "The search found related documentation, but it did not provide enough direct evidence to verify an exact command for this task.",
-    causes: Array.isArray(data.causes) ? data.causes.slice(0, 8) : [],
+      : "Related pages were found, but they did not provide enough direct evidence to verify a cause or command for this exact question.",
+    causes,
     commands,
-    sources: verifiedSources.map(s => ({
-      title: s.title,
-      url: s.url
-    })),
-    safety_note: commands.length
-      ? String(data.safety_note || "Verify commands against your exact software version before execution.")
-      : "No verified Internet commands are displayed. The search results may be related to the topic but do not prove the exact command syntax and purpose."
+    sources,
+    safety_note: hasEvidence
+      ? String(data.safety_note || "Verify the exact product version and operational context before making changes.")
+      : "No verified Internet causes or commands are displayed. The available search evidence did not directly support them."
   };
 }
 
@@ -436,47 +313,46 @@ export default {
   async fetch(request, env) {
     const origin = request.headers.get("Origin") || "";
 
-    const allowed = (env.ALLOWED_ORIGINS ||
-      DEFAULT_ALLOWED_ORIGINS.join(","))
+    const allowed = (env.ALLOWED_ORIGINS || DEFAULT_ALLOWED_ORIGINS.join(","))
       .split(",")
       .map(x => x.trim())
       .filter(Boolean);
 
-    const headers = getCors(origin, allowed);
+    const headers = corsHeaders(origin, allowed);
 
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers });
     }
 
     if (request.method !== "POST") {
-      return response({ error: "Use POST /search" }, 405, headers);
+      return jsonResponse({ error: "Use POST /search" }, 405, headers);
     }
 
     if (headers["Access-Control-Allow-Origin"] === "null") {
-      return response({ error: "Origin not allowed" }, 403, headers);
+      return jsonResponse({ error: "Origin not allowed" }, 403, headers);
     }
 
     if (!env.AI) {
-      return response({ error: "Cloudflare AI binding AI is missing" }, 503, headers);
+      return jsonResponse({ error: "Cloudflare Workers AI binding AI is not configured" }, 503, headers);
     }
 
     if (!env.TAVILY_KEY) {
-      return response({ error: "TAVILY_KEY secret is missing" }, 503, headers);
+      return jsonResponse({ error: "TAVILY_KEY secret is missing" }, 503, headers);
     }
 
     let body;
 
     try {
       body = await request.json();
-    } catch (_) {
-      return response({ error: "Invalid JSON request body" }, 400, headers);
+    } catch {
+      return jsonResponse({ error: "Invalid JSON request body" }, 400, headers);
     }
 
     const query = String(body.query || "").trim().slice(0, 1200);
-    const vendor = String(body.vendor || "Network infrastructure").trim();
+    const vendor = String(body.vendor || "Network infrastructure").trim().slice(0, 100);
 
     if (query.length < 4) {
-      return response({ error: "Please enter a more detailed question" }, 400, headers);
+      return jsonResponse({ error: "Please describe your issue in more detail" }, 400, headers);
     }
 
     try {
@@ -488,37 +364,26 @@ export default {
         queries.map(q => tavilySearch(env.TAVILY_KEY, q, config.domains))
       );
 
-      const results = normalizeResults(
-        batches.flat(),
-        query,
-        vendorKey
-      );
+      const results = normalizeResults(batches.flat(), query);
 
       if (!results.length) {
-        return response({
-          summary: "No sufficiently relevant official documentation was found.",
+        return jsonResponse({
+          summary: "No sufficiently relevant vendor documentation was found.",
           causes: [],
           commands: [],
           sources: [],
-          safety_note: "No Internet commands are presented because relevant supporting evidence was not found."
+          safety_note: "No Internet commands or causes are displayed because relevant evidence was not found."
         }, 200, headers);
       }
 
-      const evidence = results.map((r, i) => `
-RESULT ${i + 1}
-Title: ${r.title}
-URL: ${r.url}
-Relevance: ${r.relevance}
-Content:
-${r.content}
-`).join("\n-------------------\n");
-
-      const version = extractVersion(query);
+      const evidence = results.map((r, i) =>
+        `RESULT ${i + 1}\nTitle: ${r.title}\nURL: ${r.url}\nContent:\n${r.content}`
+      ).join("\n\n-----\n\n");
 
       const prompt = `
-User-selected vendor: ${vendor}
+Vendor: ${vendor}
 Detected product: ${config.label}
-Requested version: ${version || "Not specified"}
+Version in question: ${extractVersion(query) || "Not specified"}
 
 Exact user question:
 ${query}
@@ -526,21 +391,16 @@ ${query}
 Search evidence:
 ${evidence}
 
-Important:
-- Select only directly relevant sources.
-- Do not select generic lab pages or unrelated documentation.
-- Do not infer command syntax from a general description.
-- A command must be explicitly present in the source content.
-- If a source does not show the exact command, do not return it.
-- Do not claim that a command verifies certificate chains unless the source explicitly supports that function.
-- Do not provide commands that expose private keys.
-- If no command is directly supported, return an empty commands array.
-- Every source URL must be copied exactly.
-
-Return the required JSON object only.
+For every cause, include source_url and an evidence_quote copied exactly from its source content.
+For every command, include source_url and reproduce the exact command text found in that source.
+If a source does not explicitly show the command and support its purpose, omit it.
+Do not infer causes from a mention of a setting.
+Return empty arrays when evidence is insufficient.
+Sources must be exact URLs above.
+Return JSON only.
 `;
 
-      const aiResult = await env.AI.run(MODEL, {
+      const ai = await env.AI.run(MODEL, {
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
           { role: "user", content: prompt }
@@ -550,22 +410,20 @@ Return the required JSON object only.
         temperature: 0.1
       });
 
-      const output =
-        aiResult?.response ??
-        aiResult?.choices?.[0]?.message?.content ??
+      const output = ai?.response ??
+        ai?.choices?.[0]?.message?.content ??
         null;
 
       if (output === null || output === undefined) {
         throw new Error("Cloudflare AI returned an empty response");
       }
 
-      const parsed = parseAI(output);
-      const finalData = normalizeAIData(parsed, results);
+      const result = normalizeAIData(parseAI(output), results);
 
-      return response(finalData, 200, headers);
+      return jsonResponse(result, 200, headers);
 
     } catch (error) {
-      return response({
+      return jsonResponse({
         error: "Internet search or AI processing failed.",
         details: error?.message || "Unknown error"
       }, 502, headers);
