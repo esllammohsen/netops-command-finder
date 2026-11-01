@@ -422,6 +422,12 @@
     text-align:left;
   }
 
+
+  .smart-hint{font-size:12px;line-height:1.55;color:#526579;background:#edf3f8;border-left:3px solid var(--accent);padding:8px 10px;margin:0 0 12px;border-radius:2px;}
+  .smart-hint strong{color:var(--accent);}
+  body.dark .smart-hint{background:#202d3a;color:#b8c7d8;}
+  body.dark .smart-hint strong{color:#a9cbe8;}
+
   /* ---- dark mode ---- */
   body.dark{
     --bg:#1b1e22;
@@ -523,6 +529,7 @@
   </div>
   <div class="page">
     <div class="sub">Describe your issue and get the most relevant commands with a short explanation for each.</div>
+    <div class="smart-hint"><strong>Smart Search</strong> — describe the symptom in your own words (Arabic or English). It matches related technical concepts, not only exact keywords. Search stays on this device.</div>
 
     <div class="box">
       <textarea id="q" placeholder="e.g. decrypt traffic after capturing a pcap"></textarea>
@@ -539,7 +546,7 @@
       <div class="empty">Describe the issue above and start searching</div>
     </div>
 
-    <footer class="dbfoot">local database: <span id="dbCount"></span> commands — no internet required</footer>
+    <footer class="dbfoot">local database: <span id="dbCount"></span> commands — smart local search, no internet required</footer>
   </div>
 </div>
 
@@ -562,7 +569,7 @@
       <div class="empty">Describe a task above to compare it across F5, PaloAlto, FortiGate, and FTD/FMC</div>
     </div>
 
-    <footer class="dbfoot">local database: <span id="dbCountCompare"></span> commands — no internet required</footer>
+    <footer class="dbfoot">local database: <span id="dbCountCompare"></span> commands — smart local search, no internet required</footer>
   </div>
 </div>
 
@@ -724,17 +731,58 @@ function vendorEntries(){
   return DB.filter(function(e){ return e.vendor === currentVendor; });
 }
 
+// Local semantic layer: translate common symptoms and natural-language phrases
+// into the technical concepts already represented in the command database.
+// This runs entirely in the browser; it does not send search text anywhere.
+const SMART_CONCEPTS = [
+  {p:["one pool member","single pool member","only one server","traffic to one server","one node only","عضو واحد","سيرفر واحد","كل الترافيك على سيرفر"], t:["pool","member","node","load balancing","persistence","monitor","availability","health"]},
+  {p:["connection reset","tcp reset","rst from server","rst from client","reset after syn","resets after syn","بيعمل rst","الاتصال بيتقفل","connection dropped"], t:["tcp","rst","reset","syn","handshake","connection","packet capture","pcap","session"]},
+  {p:["cannot connect","connection failed","connection timeout","no connectivity","server unreachable","مش عارف اوصل","الاتصال مش شغال","مفيش اتصال"], t:["connectivity","ping","route","routing","tcp","port","session","packet capture"]},
+  {p:["no traffic","traffic not passing","packets not reaching","not hitting firewall","traffic blocked","الترافيك مش بيعدي","الباكت مش واصله"], t:["packet capture","pcap","policy","access rule","route","interface","drop","session"]},
+  {p:["high cpu","cpu usage high","memory usage","high memory","الجهاز بطيء","استهلاك cpu","استهلاك الرام"], t:["cpu","memory","performance","process","system resource","diagnostic","monitor"]},
+  {p:["ha failover","standby down","active passive","ha not syncing","heartbeat down","مشكلة ha","الستاندباي واقع","الفايل اوفر"], t:["ha","failover","sync","heartbeat","state","peer","cluster"]},
+  {p:["vpn not working","vpn disconnected","globalprotect issue","remote access issue","ال vpn مش شغال","مشكلة vpn"], t:["vpn","tunnel","ike","ipsec","globalprotect","remote access","authentication"]},
+  {p:["ssl handshake failed","tls handshake","bad record mac","bad decrypt","certificate error","مشكلة ssl","الشهادة مش شغالة"], t:["ssl","tls","handshake","certificate","decrypt","cipher","clientssl","serverssl"]},
+  {p:["website returns 503","http 503","http 502","http 504","service unavailable","الموقع واقع","الابلكيشن مش بيفتح"], t:["http","https","503","502","504","virtual server","pool","member","health monitor","response"]},
+  {p:["dns not resolving","dns issue","name resolution","cannot resolve hostname","مشكلة dns","الاسم مش بيتحل"], t:["dns","resolve","name resolution","53","udp","tcp","query"]},
+  {p:["routing issue","wrong route","route missing","ospf neighbor down","bgp down","مشكلة routing","الراوت مش موجود"], t:["route","routing","ospf","bgp","neighbor","advertise","rib","fib"]},
+  {p:["blocked by waf","waf false positive","request blocked","illegal url","support id","ال waf عامل بلوك","الريكوست بيتمنع"], t:["waf","asm","awaf","policy","violation","signature","request","event"]},
+  {p:["rate limit","too many requests","brute force","repeated login attempts","طلبات كتير","محاولات تسجيل كتير"], t:["rate limiting","dos","brute force","request","threshold","source ip","lockout"]},
+  {p:["packet capture","capture packets","take pcap","analyze pcap","عايز اعمل كابتشر","التقاط باكيت"], t:["tcpdump","pcap","capture","packet","wireshark"]},
+  {p:["configuration backup","take backup","restore config","export configuration","باك اب للكونفجريشن","نسخة احتياطية"], t:["backup","restore","export","configuration","snapshot"]}
+];
+
+function smartQueryTokens(query){
+  var base = normalize(query);
+  var lower = query.toLowerCase();
+  var expanded = base.slice();
+  SMART_CONCEPTS.forEach(function(concept){
+    if(concept.p.some(function(phrase){ return lower.includes(phrase); })){
+      expanded = expanded.concat(concept.t.flatMap(function(term){ return normalize(term); }));
+    }
+  });
+  return Array.from(new Set(expanded));
+}
+
 function search(query, category){
-  const tokens = normalize(query);
+  const tokens = smartQueryTokens(query);
   if(tokens.length === 0) return [];
   let results = [];
   for(const entry of vendorEntries()){
     if(category && entry.category !== category) continue;
-    const s = scoreEntry(tokens, entry);
-    if(s > 0) results.push([s, entry]);
+    const baseScore = scoreEntry(tokens, entry);
+    const phraseBlob = (entry.title_en + " " + entry.title_ar + " " + entry.keywords.join(" ") + " " + entry.explanation_en + " " + entry.explanation_ar).toLowerCase();
+    let phraseBoost = 0;
+    SMART_CONCEPTS.forEach(function(concept){
+      if(concept.p.some(function(phrase){ return query.toLowerCase().includes(phrase); })){
+        if(concept.t.some(function(term){ return phraseBlob.includes(term.toLowerCase()); })) phraseBoost += 1.5;
+      }
+    });
+    const score = baseScore + phraseBoost;
+    if(score > 0) results.push([score, entry]);
   }
   results.sort((a,b) => b[0]-a[0]);
-  return results.slice(0, 6);
+  return results.slice(0, 8);
 }
 
 function escapeHtml(s){
@@ -758,7 +806,7 @@ function render(results, tokens){
   const box = document.getElementById("results");
   const meta = document.getElementById("meta");
   if(results.length === 0){
-    box.innerHTML = '<div class="empty">No matching results. Try different keywords or change the category.</div>';
+    box.innerHTML = '<div class="empty">No close match found in this device database. Try describing the symptom differently or clear the category filter.</div>';
     meta.textContent = "";
     return;
   }
@@ -894,7 +942,7 @@ function runSearch(){
     return;
   }
 
-  var tokens = normalize(q);
+  var tokens = smartQueryTokens(q);
   var results = search(q, cat);
 
   if(results.length === 0){
@@ -908,7 +956,7 @@ function runSearch(){
         runSearch();
       });
     } else {
-      box.innerHTML = '<div class="empty">No matching results. Try different keywords or change the category.</div>';
+      box.innerHTML = '<div class="empty">No close match found in this device database. Try describing the symptom differently or clear the category filter.</div>';
     }
     document.getElementById("meta").textContent = "";
     return;
