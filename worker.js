@@ -113,20 +113,24 @@ Provide relevant CLI commands, likely causes, verification steps, and safety not
         ],
         max_tokens: 1800,
         temperature: 0.2
+       response_format: { type: "json_object" }
       });
 
-      const outputText = result?.response ||
-        result?.choices?.[0]?.message?.content || "";
+      const output = result?.response ??
+  result?.choices?.[0]?.message?.content ?? "";
 
-      if (!outputText) {
-        return json({ error: "Cloudflare AI returned no text. Please try again." }, 502, headers);
-      }
+if (!output) {
+  return json({ error: "Cloudflare AI returned no text. Please try again." }, 502, headers);
+}
 
-      let data;
-      try {
-        data = parseJsonOutput(outputText);
-      } catch (_) {
-        return json({ error: "The AI response could not be parsed. Please try again." }, 502, headers);
+let data;
+try {
+  data = typeof output === "object"
+    ? output
+    : parseJsonOutput(output);
+} catch (_) {
+  return json({ error: "The AI response could not be parsed. Please try again." }, 502, headers);
+}
       }
 
       if (!Array.isArray(data.commands)) data.commands = [];
