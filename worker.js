@@ -1,7 +1,8 @@
 
 /**
  * NetOps Command Finder
- * Tavily Real Internet Search + Cloudflare Workers AI
+ * Tavily targeted official documentation search
+ * Cloudflare Workers AI + JSON Mode
  *
  * Required:
  * - AI binding
@@ -18,7 +19,8 @@ const VENDOR_DOMAINS = {
   f5: [
     "my.f5.com",
     "clouddocs.f5.com",
-    "techdocs.f5.com"
+    "techdocs.f5.com",
+    "support.f5.com"
   ],
   cisco: [
     "cisco.com",
@@ -38,6 +40,7 @@ const VENDOR_DOMAINS = {
     "my.f5.com",
     "clouddocs.f5.com",
     "techdocs.f5.com",
+    "support.f5.com",
     "docs.paloaltonetworks.com",
     "knowledgebase.paloaltonetworks.com",
     "docs.fortinet.com",
@@ -48,50 +51,78 @@ const VENDOR_DOMAINS = {
 const SYSTEM_INSTRUCTIONS = `
 You are a senior network and security infrastructure engineer.
 
-Use ONLY the supplied web search results as evidence
-for internet-found commands and source citations.
+Your task is to analyze real web search results and answer
+the user's exact technical question.
 
-Return ONLY valid JSON:
+IMPORTANT:
+Use ONLY the supplied search results as evidence for
+internet-discovered commands and source citations.
+
+Do not treat a result as relevant merely because it mentions
+the same vendor or product family.
+
+RELEVANCE RULES:
+- Match the exact product and feature in the question.
+- Respect the requested software version.
+- Exclude unrelated products, mobile apps, integrations,
+  cloud products, and unrelated deployment guides.
+- For F5 BIG-IP questions, do not use F5 Access,
+  OpenStack, or SSL Orchestrator results unless the
+  question explicitly asks about them.
+- Prefer official product documentation and vendor KB articles.
+- If search results do not directly support the answer,
+  clearly say that evidence is insufficient.
+
+COMMAND RULES:
+- Never invent commands, flags, paths, or configuration syntax.
+- Do not infer a command from a general product description.
+- Only provide commands directly supported by the search evidence.
+- Do not confuse Linux OpenSSL commands with BIG-IP TMSH commands.
+- Clearly identify the CLI context.
+- Prefer read-only diagnostic commands.
+- Mark configuration changes and disruptive operations.
+- Do not recommend exporting or exposing private keys.
+- If a command is not supported by the evidence, omit it.
+
+Return ONLY valid JSON in this exact structure:
 
 {
- "summary": "short explanation",
- "causes": [
-   {
-     "title": "possible cause",
-     "detail": "explanation and verification"
-   }
- ],
- "commands": [
-   {
-     "command": "exact command",
-     "platform": "vendor/product and CLI context",
-     "description": "what it does",
-     "when_to_use": "when to use it",
-     "risk": "Read-only | Changes configuration | Potentially disruptive",
-     "source_title": "exact source title or empty string",
-     "source_url": "exact source URL or empty string"
-   }
- ],
- "sources": [
-   {
-     "title": "source title",
-     "url": "exact source URL"
-   }
- ],
- "safety_note": "brief caution"
+  "summary": "Answer to the exact question",
+  "causes": [
+    {
+      "title": "Possible cause",
+      "detail": "Explanation and verification"
+    }
+  ],
+  "commands": [
+    {
+      "command": "Exact command",
+      "platform": "Product, version and CLI context",
+      "description": "What it does",
+      "when_to_use": "When to use it",
+      "risk": "Read-only | Changes configuration | Potentially disruptive",
+      "source_title": "Exact source title",
+      "source_url": "Exact source URL from search results"
+    }
+  ],
+  "sources": [
+    {
+      "title": "Exact source title",
+      "url": "Exact source URL from search results"
+    }
+  ],
+  "safety_note": "Safety warning or verification limitation"
 }
 
-Rules:
-- Never invent command syntax, flags, paths or URLs.
-- Do not output commands unless search results support them.
-- Prefer diagnostic/read-only commands.
-- Clearly label configuration changes, session clears,
-  restarts, failovers and disruptive actions.
-- Specify CLI context wherever possible.
-- Do not assume software versions.
-- Use only URLs from supplied search results.
-- If no reliable command is supported, return an empty commands array.
-- Return valid JSON only, without Markdown fences.
+The sources array must contain ONLY results directly relevant
+to the user's question.
+
+If no relevant source exists:
+- Return an empty sources array.
+- Return an empty commands array.
+- Explain that more specific documentation is needed.
+
+Return valid JSON only, without Markdown fences.
 `;
 
 function corsHeaders(origin, allowed) {
@@ -127,7 +158,7 @@ function parseAIResponse(output) {
     throw new Error("Empty AI response");
   }
 
-  let cleaned = output.trim()
+  const cleaned = output.trim()
     .replace(/^```json\s*/i, "")
     .replace(/^```\s*/i, "")
     .replace(/\s*```$/i, "")
@@ -147,7 +178,7 @@ function parseAIResponse(output) {
   }
 }
 
-function getVendorKey(vendor, query) {
+function detectVendor(vendor, query) {
   const value = `${vendor} ${query}`.toLowerCase();
 
   if (/\bf5\b|big-?ip|tmsh|asm|awaf|ltm/.test(value)) {
@@ -169,8 +200,37 @@ function getVendorKey(vendor, query) {
   return "generic";
 }
 
-function makeSearchQuery(vendor, query) {
-  return `${String(vendor || "network infrastructure").slice(0, 80)} ${String(query || "").slice(0, 280)} official documentation CLI troubleshooting command`.trim();
+function extractVersion(text) {
+  const match = String(text).match(
+    /\b(?:BIG-IP|TMOS|PAN-OS|FortiOS|FTD|FMC)?\s*v?(\d{1,2}\.\d{1,2}(?:\.\d{1,2})?)\b/i
+  );
+
+  return match ? match[1] : "";
+}
+
+function buildTargetedQuery(vendorKey, vendor, query) {
+  const version = extractVersion(query);
+
+  const productNames = {
+    f5: "F5 BIG-IP TMOS",
+    cisco: "Cisco network security product",
+    paloalto: "Palo Alto Networks PAN-OS",
+    fortinet: "Fortinet FortiGate FortiOS",
+    generic: vendor
+  };
+
+  const product = productNames[vendorKey] || vendor;
+
+  const versionText = version
+    ? `software version ${version}`
+    : "";
+
+  return [
+    product,
+    versionText,
+    query,
+    "official technical documentation troubleshooting configuration CLI"
+  ].filter(Boolean).join(" ");
 }
 
 async function tavilySearch(apiKey, query, domains) {
@@ -184,9 +244,9 @@ async function tavilySearch(apiKey, query, domains) {
       body: JSON.stringify({
         api_key: apiKey,
         query,
-        search_depth: "basic",
+        search_depth: "advanced",
         topic: "general",
-        max_results: 5,
+        max_results: 8,
         include_answer: false,
         include_raw_content: false,
         include_domains: domains
@@ -211,17 +271,18 @@ async function tavilySearch(apiKey, query, domains) {
 }
 
 function cleanSearchResults(results) {
-  return results.slice(0, 5)
+  return results.slice(0, 8)
     .map(item => ({
       title: String(item.title || "Untitled source").slice(0, 250),
       url: String(item.url || ""),
-      content: String(item.content || "").slice(0, 1800),
+      content: String(item.content || "").slice(0, 2200),
       score: typeof item.score === "number"
         ? item.score
         : null
     }))
     .filter(item =>
-      /^https:\/\//i.test(item.url) && item.content
+      /^https:\/\//i.test(item.url) &&
+      item.content.length > 30
     );
 }
 
@@ -237,6 +298,25 @@ function normalizeAIData(data, searchResults) {
     ])
   );
 
+  // Only allow citations that Tavily actually returned.
+  const sources = Array.isArray(data.sources)
+    ? data.sources
+        .filter(source =>
+          source &&
+          typeof source.url === "string" &&
+          allowedSources.has(source.url)
+        )
+        .slice(0, 8)
+        .map(source => ({
+          title: allowedSources.get(source.url),
+          url: source.url
+        }))
+    : [];
+
+  const approvedSourceUrls = new Set(
+    sources.map(source => source.url)
+  );
+
   const commands = Array.isArray(data.commands)
     ? data.commands.slice(0, 10)
     : [];
@@ -245,7 +325,7 @@ function normalizeAIData(data, searchResults) {
     .map(command => {
       const url =
         typeof command.source_url === "string" &&
-        allowedSources.has(command.source_url)
+        approvedSourceUrls.has(command.source_url)
           ? command.source_url
           : "";
 
@@ -261,7 +341,10 @@ function normalizeAIData(data, searchResults) {
         source_url: url
       };
     })
-    .filter(command => command.command);
+    .filter(command =>
+      command.command &&
+      command.source_url
+    );
 
   return {
     summary: String(data.summary || ""),
@@ -272,15 +355,11 @@ function normalizeAIData(data, searchResults) {
 
     commands: safeCommands,
 
-    // URLs are copied directly from Tavily.
-    sources: searchResults.map(source => ({
-      title: source.title,
-      url: source.url
-    })),
+    sources,
 
     safety_note: String(
       data.safety_note ||
-      "Verify commands against the exact product and software version before execution."
+      "Verify all commands against the installed product version before execution."
     )
   };
 }
@@ -332,9 +411,7 @@ export default {
 
     if (!env.TAVILY_KEY) {
       return jsonResponse(
-        {
-          error: "TAVILY_KEY secret is missing in Cloudflare Worker settings"
-        },
+        { error: "TAVILY_KEY secret is missing" },
         503,
         headers
       );
@@ -364,28 +441,30 @@ export default {
 
     if (query.length < 4) {
       return jsonResponse(
-        {
-          error: "Please describe the issue in more detail"
-        },
+        { error: "Please describe the issue in more detail" },
         400,
         headers
       );
     }
 
     try {
-      // 1. Determine vendor and official domains.
-      const vendorKey = getVendorKey(vendor, query);
+      // Step 1: Identify vendor and exact product scope.
+      const vendorKey = detectVendor(vendor, query);
 
-      const searchQuery = makeSearchQuery(
+      const domains = VENDOR_DOMAINS[vendorKey];
+
+      // Step 2: Build a product- and version-aware query.
+      const searchQuery = buildTargetedQuery(
+        vendorKey,
         vendor,
         query
       );
 
-      // 2. Perform REAL Tavily internet search.
+      // Step 3: Search official vendor documentation.
       const rawResults = await tavilySearch(
         env.TAVILY_KEY,
         searchQuery,
-        VENDOR_DOMAINS[vendorKey]
+        domains
       );
 
       const searchResults = cleanSearchResults(rawResults);
@@ -393,40 +472,61 @@ export default {
       if (searchResults.length === 0) {
         return jsonResponse(
           {
-            error: "Tavily returned no usable official documentation results. Try adding the product model and software version."
+            error: "No usable official documentation results found. Try including the exact product and software version."
           },
           502,
           headers
         );
       }
 
-      // 3. Prepare actual search evidence for the AI.
+      // Step 4: Send actual search evidence to the AI.
       const evidence = searchResults
-        .map((item, index) =>
-          `[${index + 1}] ${item.title}\nURL: ${item.url}\nContent: ${item.content}`
-        )
-        .join("\n\n");
+        .map((item, index) => {
+          return [
+            `RESULT ${index + 1}`,
+            `Title: ${item.title}`,
+            `URL: ${item.url}`,
+            `Relevance score: ${item.score ?? "Not provided"}`,
+            `Content: ${item.content}`
+          ].join("\n");
+        })
+        .join("\n\n----------------\n\n");
+
+      const version = extractVersion(query);
 
       const userPrompt = `
-Selected platform/vendor: ${vendor}
+Selected vendor: ${vendor}
+Detected product family: ${vendorKey}
+Requested version: ${version || "Not specified"}
 
-User's issue:
+EXACT USER QUESTION:
 ${query}
 
-REAL WEB SEARCH RESULTS:
+SEARCH RESULTS:
 ${evidence}
 
-Explain the issue and return only commands supported
-by these search results.
+IMPORTANT TASK:
+Evaluate every result for direct relevance to the exact
+product, feature, and question.
 
-Use exact source URLs from the results.
-If no command is sufficiently supported,
-return an empty commands array.
+Do not use results about unrelated products or integrations.
+For example, if the question is about F5 BIG-IP Client SSL
+certificate chains, exclude F5 Access mobile app and
+OpenStack integration documentation.
 
-Return the required JSON object.
+Select only directly relevant sources.
+Every command must be directly supported by at least
+one selected source.
+
+If the evidence is insufficient:
+- Explain the limitation in summary.
+- Return an empty commands array.
+- Do not guess.
+
+Return only the required JSON object.
 `;
 
-      // 4. Analyze search results with Cloudflare AI.
+      // Step 5: Analyze evidence with Cloudflare Workers AI.
       const aiResult = await env.AI.run(MODEL, {
         messages: [
           {
@@ -441,8 +541,8 @@ Return the required JSON object.
         response_format: {
           type: "json_object"
         },
-        max_tokens: 2200,
-        temperature: 0.2
+        max_tokens: 2400,
+        temperature: 0.1
       });
 
       const output =
@@ -453,15 +553,13 @@ Return the required JSON object.
 
       if (output === null || output === undefined) {
         return jsonResponse(
-          {
-            error: "Cloudflare AI returned an empty response"
-          },
+          { error: "Cloudflare AI returned an empty response" },
           502,
           headers
         );
       }
 
-      // 5. Parse and validate AI response.
+      // Step 6: Parse and validate the AI response.
       const parsed = parseAIResponse(output);
 
       const finalData = normalizeAIData(
