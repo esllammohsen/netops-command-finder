@@ -1,152 +1,298 @@
 
-/**
- * NetOps Command Finder - Cloudflare Worker
- * Cloudflare Workers AI version (Gemini removed)
- * Required binding in wrangler.toml: [ai] binding = "AI"
- */
-const DEFAULT_ALLOWED_ORIGINS = ["https://esllammohsen.github.io"];
 const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
-const SYSTEM_INSTRUCTIONS = `You are a senior network and security infrastructure troubleshooting researcher.
-Help network engineers troubleshoot Cisco, F5 BIG-IP, Palo Alto Networks, Fortinet, and related infrastructure.
-Return ONLY valid JSON with this exact shape:
-{
- "summary":"short explanation of what the symptom usually means",
- "causes":[{"title":"cause","detail":"why it may cause the symptom and how to validate it"}],
- "commands":[{"command":"exact CLI command","platform":"vendor/product and context","description":"what the command displays or does","when_to_use":"when/how to use it","risk":"Read-only | Changes configuration | Potentially disruptive","source_title":"source title","source_url":"https://..."}],
- "sources":[{"title":"source title","url":"https://..."}],
- "safety_note":"brief caution where appropriate"
-}
-Rules:
-- Return 3-8 useful commands only when you can do so reliably. Do not pad with guesses.
-- Never invent command syntax, flags, paths, or configuration hierarchy.
-- Prefer diagnostic/read-only commands. Clearly label configuration changes, session clears, restarts, and production-impacting actions.
-- State platform/context (e.g. F5 BIG-IP TMSH vs Linux shell, Cisco FTD diagnostic CLI vs FXOS, PAN-OS operational vs configuration mode).
-- Do not assume the user's software version. Mention version caveats when known.
-- Never ask for secrets, private keys, passwords, or full sensitive configurations.
-- If exact syntax is uncertain, say so and omit the command.
-- Do not fabricate source URLs or claim to have checked live documentation. If no verified source is available in the prompt, leave source_url empty and say that vendor documentation should be checked for the installed version.
-- Output valid JSON only, no Markdown fences.`;
+const DEFAULT_ALLOWED_ORIGINS = [
+  "https://esllammohsen.github.io"
+];
 
-function corsHeaders(origin, allowed) {
-  const permitted = allowed.includes("*") || allowed.includes(origin);
+const SYSTEM_INSTRUCTIONS = `
+You are a senior network and security infrastructure engineer.
+
+Help engineers troubleshoot:
+Cisco, Cisco FTD, Cisco FMC, F5 BIG-IP, Palo Alto Networks,
+Fortinet, FortiGate, FortiManager, and network infrastructure.
+
+Return ONLY a valid JSON object with this structure:
+
+{
+  "summary": "Short explanation of the issue",
+  "causes": [
+    {
+      "title": "Possible cause",
+      "detail": "Explanation and how to verify"
+    }
+  ],
+  "commands": [
+    {
+      "command": "Exact CLI command",
+      "platform": "Product and CLI context",
+      "description": "What the command does",
+      "when_to_use": "When to use it",
+      "risk": "Read-only",
+      "source_title": "Documentation title",
+      "source_url": ""
+    }
+  ],
+  "sources": [
+    {
+      "title": "Documentation title",
+      "url": ""
+    }
+  ],
+  "safety_note": "Important safety information"
+}
+
+Rules:
+- Never invent commands, command syntax, or URLs.
+- Prefer read-only troubleshooting commands.
+- Clearly identify configuration-changing commands.
+- Clearly identify potentially disruptive commands.
+- Specify the correct CLI context.
+- Do not assume a software version.
+- Mention version differences when relevant.
+- Do not claim that live documentation was searched.
+- Use official vendor documentation when a verified source is available.
+- If a source URL is not verified, leave it empty.
+- Return concise and useful results.
+- Return valid JSON only, without Markdown fences.
+`;
+
+function getCorsHeaders(origin, allowedOrigins) {
+  const isAllowed =
+    allowedOrigins.includes("*") ||
+    allowedOrigins.includes(origin);
+
   return {
-    "Access-Control-Allow-Origin": permitted ? (allowed.includes("*") ? "*" : origin) : "null",
+    "Access-Control-Allow-Origin": isAllowed
+      ? (allowedOrigins.includes("*") ? "*" : origin)
+      : "null",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
     "Vary": "Origin"
   };
 }
 
-function json(data, status, headers) {
+function jsonResponse(data, status, headers) {
   return new Response(JSON.stringify(data), {
-    status: status || 200,
-    headers: { "Content-Type": "application/json; charset=utf-8", ...headers }
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      ...headers
+    }
   });
 }
 
-function parseJsonOutput(value) {
-  const cleaned = String(value || "")
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```$/, "")
+function parseAIResponse(output) {
+  // JSON Mode may return an object directly.
+  if (output && typeof output === "object") {
+    return output;
+  }
+
+  if (typeof output !== "string" || !output.trim()) {
+    throw new Error("Empty AI response");
+  }
+
+  let cleaned = output.trim();
+
+  // Remove Markdown code fences if present.
+  cleaned = cleaned
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
     .trim();
 
   try {
     return JSON.parse(cleaned);
   } catch (_) {
-    const start = cleaned.indexOf("{");
-    const end = cleaned.lastIndexOf("}");
-    if (start >= 0 && end > start) {
-      return JSON.parse(cleaned.slice(start, end + 1));
+    // Try extracting the JSON object from surrounding text.
+    const firstBrace = cleaned.indexOf("{");
+    const lastBrace = cleaned.lastIndexOf("}");
+
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
+      return JSON.parse(
+        cleaned.substring(firstBrace, lastBrace + 1)
+      );
     }
-    throw new Error("The AI response was not valid JSON");
+
+    throw new Error("AI response is not valid JSON");
   }
+}
+
+function normalizeResult(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("Invalid AI response structure");
+  }
+
+  return {
+    summary: String(data.summary || ""),
+    causes: Array.isArray(data.causes)
+      ? data.causes.slice(0, 8)
+      : [],
+    commands: Array.isArray(data.commands)
+      ? data.commands.slice(0, 10)
+      : [],
+    sources: Array.isArray(data.sources)
+      ? data.sources.slice(0, 15)
+      : [],
+    safety_note: String(data.safety_note || "")
+  };
 }
 
 export default {
   async fetch(request, env) {
     const origin = request.headers.get("Origin") || "";
-    const allowed = (env.ALLOWED_ORIGINS || DEFAULT_ALLOWED_ORIGINS.join(","))
-      .split(",").map(x => x.trim()).filter(Boolean);
-    const headers = corsHeaders(origin, allowed);
+
+    const allowedOrigins = (
+      env.ALLOWED_ORIGINS ||
+      DEFAULT_ALLOWED_ORIGINS.join(",")
+    )
+      .split(",")
+      .map(item => item.trim())
+      .filter(Boolean);
+
+    const corsHeaders = getCorsHeaders(
+      origin,
+      allowedOrigins
+    );
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers });
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders
+      });
     }
 
     if (request.method !== "POST") {
-      return json({ error: "Use POST /search" }, 405, headers);
+      return jsonResponse(
+        { error: "Use POST /search" },
+        405,
+        corsHeaders
+      );
     }
 
-    if (headers["Access-Control-Allow-Origin"] === "null") {
-      return json({ error: "Origin not allowed" }, 403, headers);
+    if (corsHeaders["Access-Control-Allow-Origin"] === "null") {
+      return jsonResponse(
+        { error: "Origin not allowed" },
+        403,
+        corsHeaders
+      );
     }
 
     if (!env.AI) {
-      return json({ error: "Workers AI binding AI is not configured" }, 503, headers);
+      return jsonResponse(
+        { error: "Cloudflare AI binding is missing. Check wrangler.toml." },
+        503,
+        corsHeaders
+      );
     }
 
     let body;
+
     try {
       body = await request.json();
-    } catch {
-      return json({ error: "Invalid JSON body" }, 400, headers);
+    } catch (_) {
+      return jsonResponse(
+        { error: "Invalid JSON request body" },
+        400,
+        corsHeaders
+      );
     }
 
-    const query = String(body.query || "").trim().slice(0, 1200);
-    const vendor = String(body.vendor || "Network infrastructure").trim().slice(0, 100);
+    const query = String(body.query || "")
+      .trim()
+      .slice(0, 1500);
+
+    const vendor = String(body.vendor || "Network infrastructure")
+      .trim()
+      .slice(0, 100);
 
     if (query.length < 4) {
-      return json({ error: "Please describe the issue in more detail" }, 400, headers);
+      return jsonResponse(
+        { error: "Please enter a more detailed question." },
+        400,
+        corsHeaders
+      );
     }
 
-    const userPrompt = `Device/vendor selected in the app: ${vendor}
-User's issue: ${query}
+    const userPrompt = `
+Selected platform: ${vendor}
 
-Provide relevant CLI commands, likely causes, verification steps, and safety notes. Return only the required JSON object.`;
+User question:
+${query}
+
+Explain the likely causes and provide accurate
+diagnostic commands and troubleshooting steps.
+
+Return the required JSON structure.
+`;
 
     try {
       const result = await env.AI.run(MODEL, {
         messages: [
-          { role: "system", content: SYSTEM_INSTRUCTIONS },
-          { role: "user", content: userPrompt }
+          {
+            role: "system",
+            content: SYSTEM_INSTRUCTIONS
+          },
+          {
+            role: "user",
+            content: userPrompt
+          }
         ],
-        max_tokens: 1800,
+        response_format: {
+          type: "json_object"
+        },
+        max_tokens: 2200,
         temperature: 0.2
-       response_format: { type: "json_object" }
       });
 
-      const output = result?.response ??
-  result?.choices?.[0]?.message?.content ?? "";
+      // Support both JSON object and text responses.
+      const output =
+        result?.response ??
+        result?.choices?.[0]?.message?.content ??
+        result?.result?.response ??
+        null;
 
-if (!output) {
-  return json({ error: "Cloudflare AI returned no text. Please try again." }, 502, headers);
-}
-
-let data;
-try {
-  data = typeof output === "object"
-    ? output
-    : parseJsonOutput(output);
-} catch (_) {
-  return json({ error: "The AI response could not be parsed. Please try again." }, 502, headers);
-}
+      if (output === null || output === undefined) {
+        return jsonResponse(
+          {
+            error: "Cloudflare AI returned an empty response."
+          },
+          502,
+          corsHeaders
+        );
       }
 
-      if (!Array.isArray(data.commands)) data.commands = [];
-      if (!Array.isArray(data.causes)) data.causes = [];
-      if (!Array.isArray(data.sources)) data.sources = [];
+      let parsedData;
 
-      data.commands = data.commands.slice(0, 10);
-      data.causes = data.causes.slice(0, 8);
-      data.sources = data.sources.slice(0, 15);
+      try {
+        parsedData = parseAIResponse(output);
+        parsedData = normalizeResult(parsedData);
+      } catch (parseError) {
+        return jsonResponse(
+          {
+            error: "Could not process the AI response.",
+            details: parseError.message
+          },
+          502,
+          corsHeaders
+        );
+      }
 
-      return json(data, 200, headers);
+      return jsonResponse(
+        parsedData,
+        200,
+        corsHeaders
+      );
 
     } catch (error) {
-      return json({
-        error: "Cloudflare AI request failed: " + (error.message || "unknown error")
-      }, 502, headers);
+      return jsonResponse(
+        {
+          error: "Cloudflare AI request failed.",
+          details: error?.message || "Unknown error"
+        },
+        502,
+        corsHeaders
+      );
     }
   }
 };
