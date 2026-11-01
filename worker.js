@@ -1,70 +1,106 @@
 
+/**
+ * NetOps Command Finder
+ * Tavily Real Internet Search + Cloudflare Workers AI
+ *
+ * Required:
+ * - AI binding
+ * - TAVILY_KEY secret
+ */
+
 const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
 const DEFAULT_ALLOWED_ORIGINS = [
   "https://esllammohsen.github.io"
 ];
 
+const VENDOR_DOMAINS = {
+  f5: [
+    "my.f5.com",
+    "clouddocs.f5.com",
+    "techdocs.f5.com"
+  ],
+  cisco: [
+    "cisco.com",
+    "developer.cisco.com"
+  ],
+  paloalto: [
+    "docs.paloaltonetworks.com",
+    "knowledgebase.paloaltonetworks.com"
+  ],
+  fortinet: [
+    "docs.fortinet.com",
+    "community.fortinet.com"
+  ],
+  generic: [
+    "cisco.com",
+    "developer.cisco.com",
+    "my.f5.com",
+    "clouddocs.f5.com",
+    "techdocs.f5.com",
+    "docs.paloaltonetworks.com",
+    "knowledgebase.paloaltonetworks.com",
+    "docs.fortinet.com",
+    "community.fortinet.com"
+  ]
+};
+
 const SYSTEM_INSTRUCTIONS = `
 You are a senior network and security infrastructure engineer.
 
-Help engineers troubleshoot:
-Cisco, Cisco FTD, Cisco FMC, F5 BIG-IP, Palo Alto Networks,
-Fortinet, FortiGate, FortiManager, and network infrastructure.
+Use ONLY the supplied web search results as evidence
+for internet-found commands and source citations.
 
-Return ONLY a valid JSON object with this structure:
+Return ONLY valid JSON:
 
 {
-  "summary": "Short explanation of the issue",
-  "causes": [
-    {
-      "title": "Possible cause",
-      "detail": "Explanation and how to verify"
-    }
-  ],
-  "commands": [
-    {
-      "command": "Exact CLI command",
-      "platform": "Product and CLI context",
-      "description": "What the command does",
-      "when_to_use": "When to use it",
-      "risk": "Read-only",
-      "source_title": "Documentation title",
-      "source_url": ""
-    }
-  ],
-  "sources": [
-    {
-      "title": "Documentation title",
-      "url": ""
-    }
-  ],
-  "safety_note": "Important safety information"
+ "summary": "short explanation",
+ "causes": [
+   {
+     "title": "possible cause",
+     "detail": "explanation and verification"
+   }
+ ],
+ "commands": [
+   {
+     "command": "exact command",
+     "platform": "vendor/product and CLI context",
+     "description": "what it does",
+     "when_to_use": "when to use it",
+     "risk": "Read-only | Changes configuration | Potentially disruptive",
+     "source_title": "exact source title or empty string",
+     "source_url": "exact source URL or empty string"
+   }
+ ],
+ "sources": [
+   {
+     "title": "source title",
+     "url": "exact source URL"
+   }
+ ],
+ "safety_note": "brief caution"
 }
 
 Rules:
-- Never invent commands, command syntax, or URLs.
-- Prefer read-only troubleshooting commands.
-- Clearly identify configuration-changing commands.
-- Clearly identify potentially disruptive commands.
-- Specify the correct CLI context.
-- Do not assume a software version.
-- Mention version differences when relevant.
-- Do not claim that live documentation was searched.
-- Use official vendor documentation when a verified source is available.
-- If a source URL is not verified, leave it empty.
-- Return concise and useful results.
+- Never invent command syntax, flags, paths or URLs.
+- Do not output commands unless search results support them.
+- Prefer diagnostic/read-only commands.
+- Clearly label configuration changes, session clears,
+  restarts, failovers and disruptive actions.
+- Specify CLI context wherever possible.
+- Do not assume software versions.
+- Use only URLs from supplied search results.
+- If no reliable command is supported, return an empty commands array.
 - Return valid JSON only, without Markdown fences.
 `;
 
-function getCorsHeaders(origin, allowedOrigins) {
-  const isAllowed =
-    allowedOrigins.includes("*") ||
-    allowedOrigins.includes(origin);
+function corsHeaders(origin, allowed) {
+  const permitted =
+    allowed.includes("*") || allowed.includes(origin);
 
   return {
-    "Access-Control-Allow-Origin": isAllowed
-      ? (allowedOrigins.includes("*") ? "*" : origin)
+    "Access-Control-Allow-Origin": permitted
+      ? (allowed.includes("*") ? "*" : origin)
       : "null",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
@@ -83,7 +119,6 @@ function jsonResponse(data, status, headers) {
 }
 
 function parseAIResponse(output) {
-  // JSON Mode may return an object directly.
   if (output && typeof output === "object") {
     return output;
   }
@@ -92,10 +127,7 @@ function parseAIResponse(output) {
     throw new Error("Empty AI response");
   }
 
-  let cleaned = output.trim();
-
-  // Remove Markdown code fences if present.
-  cleaned = cleaned
+  let cleaned = output.trim()
     .replace(/^```json\s*/i, "")
     .replace(/^```\s*/i, "")
     .replace(/\s*```$/i, "")
@@ -104,37 +136,152 @@ function parseAIResponse(output) {
   try {
     return JSON.parse(cleaned);
   } catch (_) {
-    // Try extracting the JSON object from surrounding text.
-    const firstBrace = cleaned.indexOf("{");
-    const lastBrace = cleaned.lastIndexOf("}");
+    const first = cleaned.indexOf("{");
+    const last = cleaned.lastIndexOf("}");
 
-    if (firstBrace !== -1 && lastBrace > firstBrace) {
-      return JSON.parse(
-        cleaned.substring(firstBrace, lastBrace + 1)
-      );
+    if (first >= 0 && last > first) {
+      return JSON.parse(cleaned.slice(first, last + 1));
     }
 
     throw new Error("AI response is not valid JSON");
   }
 }
 
-function normalizeResult(data) {
+function getVendorKey(vendor, query) {
+  const value = `${vendor} ${query}`.toLowerCase();
+
+  if (/\bf5\b|big-?ip|tmsh|asm|awaf|ltm/.test(value)) {
+    return "f5";
+  }
+
+  if (/cisco|\bftd\b|\bfmc\b|asa|catalyst/.test(value)) {
+    return "cisco";
+  }
+
+  if (/palo alto|pan-os|panorama/.test(value)) {
+    return "paloalto";
+  }
+
+  if (/fortinet|fortigate|fortimanager/.test(value)) {
+    return "fortinet";
+  }
+
+  return "generic";
+}
+
+function makeSearchQuery(vendor, query) {
+  return `${String(vendor || "network infrastructure").slice(0, 80)} ${String(query || "").slice(0, 280)} official documentation CLI troubleshooting command`.trim();
+}
+
+async function tavilySearch(apiKey, query, domains) {
+  const response = await fetch(
+    "https://api.tavily.com/search",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        api_key: apiKey,
+        query,
+        search_depth: "basic",
+        topic: "general",
+        max_results: 5,
+        include_answer: false,
+        include_raw_content: false,
+        include_domains: domains
+      })
+    }
+  );
+
+  const payload = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const detail =
+      payload?.detail?.error ||
+      payload?.error ||
+      `Tavily HTTP ${response.status}`;
+
+    throw new Error(detail);
+  }
+
+  return Array.isArray(payload.results)
+    ? payload.results
+    : [];
+}
+
+function cleanSearchResults(results) {
+  return results.slice(0, 5)
+    .map(item => ({
+      title: String(item.title || "Untitled source").slice(0, 250),
+      url: String(item.url || ""),
+      content: String(item.content || "").slice(0, 1800),
+      score: typeof item.score === "number"
+        ? item.score
+        : null
+    }))
+    .filter(item =>
+      /^https:\/\//i.test(item.url) && item.content
+    );
+}
+
+function normalizeAIData(data, searchResults) {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
     throw new Error("Invalid AI response structure");
   }
 
+  const allowedSources = new Map(
+    searchResults.map(source => [
+      source.url,
+      source.title
+    ])
+  );
+
+  const commands = Array.isArray(data.commands)
+    ? data.commands.slice(0, 10)
+    : [];
+
+  const safeCommands = commands
+    .map(command => {
+      const url =
+        typeof command.source_url === "string" &&
+        allowedSources.has(command.source_url)
+          ? command.source_url
+          : "";
+
+      return {
+        command: String(command.command || ""),
+        platform: String(command.platform || ""),
+        description: String(command.description || ""),
+        when_to_use: String(command.when_to_use || ""),
+        risk: String(command.risk || "Read-only"),
+        source_title: url
+          ? allowedSources.get(url)
+          : "",
+        source_url: url
+      };
+    })
+    .filter(command => command.command);
+
   return {
     summary: String(data.summary || ""),
+
     causes: Array.isArray(data.causes)
       ? data.causes.slice(0, 8)
       : [],
-    commands: Array.isArray(data.commands)
-      ? data.commands.slice(0, 10)
-      : [],
-    sources: Array.isArray(data.sources)
-      ? data.sources.slice(0, 15)
-      : [],
-    safety_note: String(data.safety_note || "")
+
+    commands: safeCommands,
+
+    // URLs are copied directly from Tavily.
+    sources: searchResults.map(source => ({
+      title: source.title,
+      url: source.url
+    })),
+
+    safety_note: String(
+      data.safety_note ||
+      "Verify commands against the exact product and software version before execution."
+    )
   };
 }
 
@@ -142,7 +289,7 @@ export default {
   async fetch(request, env) {
     const origin = request.headers.get("Origin") || "";
 
-    const allowedOrigins = (
+    const allowed = (
       env.ALLOWED_ORIGINS ||
       DEFAULT_ALLOWED_ORIGINS.join(",")
     )
@@ -150,15 +297,12 @@ export default {
       .map(item => item.trim())
       .filter(Boolean);
 
-    const corsHeaders = getCorsHeaders(
-      origin,
-      allowedOrigins
-    );
+    const headers = corsHeaders(origin, allowed);
 
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
-        headers: corsHeaders
+        headers
       });
     }
 
@@ -166,23 +310,33 @@ export default {
       return jsonResponse(
         { error: "Use POST /search" },
         405,
-        corsHeaders
+        headers
       );
     }
 
-    if (corsHeaders["Access-Control-Allow-Origin"] === "null") {
+    if (headers["Access-Control-Allow-Origin"] === "null") {
       return jsonResponse(
         { error: "Origin not allowed" },
         403,
-        corsHeaders
+        headers
       );
     }
 
     if (!env.AI) {
       return jsonResponse(
-        { error: "Cloudflare AI binding is missing. Check wrangler.toml." },
+        { error: "Cloudflare AI binding AI is not configured" },
         503,
-        corsHeaders
+        headers
+      );
+    }
+
+    if (!env.TAVILY_KEY) {
+      return jsonResponse(
+        {
+          error: "TAVILY_KEY secret is missing in Cloudflare Worker settings"
+        },
+        503,
+        headers
       );
     }
 
@@ -194,40 +348,86 @@ export default {
       return jsonResponse(
         { error: "Invalid JSON request body" },
         400,
-        corsHeaders
+        headers
       );
     }
 
     const query = String(body.query || "")
       .trim()
-      .slice(0, 1500);
+      .slice(0, 1200);
 
-    const vendor = String(body.vendor || "Network infrastructure")
+    const vendor = String(
+      body.vendor || "Network infrastructure"
+    )
       .trim()
       .slice(0, 100);
 
     if (query.length < 4) {
       return jsonResponse(
-        { error: "Please enter a more detailed question." },
+        {
+          error: "Please describe the issue in more detail"
+        },
         400,
-        corsHeaders
+        headers
       );
     }
 
-    const userPrompt = `
-Selected platform: ${vendor}
+    try {
+      // 1. Determine vendor and official domains.
+      const vendorKey = getVendorKey(vendor, query);
 
-User question:
+      const searchQuery = makeSearchQuery(
+        vendor,
+        query
+      );
+
+      // 2. Perform REAL Tavily internet search.
+      const rawResults = await tavilySearch(
+        env.TAVILY_KEY,
+        searchQuery,
+        VENDOR_DOMAINS[vendorKey]
+      );
+
+      const searchResults = cleanSearchResults(rawResults);
+
+      if (searchResults.length === 0) {
+        return jsonResponse(
+          {
+            error: "Tavily returned no usable official documentation results. Try adding the product model and software version."
+          },
+          502,
+          headers
+        );
+      }
+
+      // 3. Prepare actual search evidence for the AI.
+      const evidence = searchResults
+        .map((item, index) =>
+          `[${index + 1}] ${item.title}\nURL: ${item.url}\nContent: ${item.content}`
+        )
+        .join("\n\n");
+
+      const userPrompt = `
+Selected platform/vendor: ${vendor}
+
+User's issue:
 ${query}
 
-Explain the likely causes and provide accurate
-diagnostic commands and troubleshooting steps.
+REAL WEB SEARCH RESULTS:
+${evidence}
 
-Return the required JSON structure.
+Explain the issue and return only commands supported
+by these search results.
+
+Use exact source URLs from the results.
+If no command is sufficiently supported,
+return an empty commands array.
+
+Return the required JSON object.
 `;
 
-    try {
-      const result = await env.AI.run(MODEL, {
+      // 4. Analyze search results with Cloudflare AI.
+      const aiResult = await env.AI.run(MODEL, {
         messages: [
           {
             role: "system",
@@ -245,53 +445,44 @@ Return the required JSON structure.
         temperature: 0.2
       });
 
-      // Support both JSON object and text responses.
       const output =
-        result?.response ??
-        result?.choices?.[0]?.message?.content ??
-        result?.result?.response ??
+        aiResult?.response ??
+        aiResult?.choices?.[0]?.message?.content ??
+        aiResult?.result?.response ??
         null;
 
       if (output === null || output === undefined) {
         return jsonResponse(
           {
-            error: "Cloudflare AI returned an empty response."
+            error: "Cloudflare AI returned an empty response"
           },
           502,
-          corsHeaders
+          headers
         );
       }
 
-      let parsedData;
+      // 5. Parse and validate AI response.
+      const parsed = parseAIResponse(output);
 
-      try {
-        parsedData = parseAIResponse(output);
-        parsedData = normalizeResult(parsedData);
-      } catch (parseError) {
-        return jsonResponse(
-          {
-            error: "Could not process the AI response.",
-            details: parseError.message
-          },
-          502,
-          corsHeaders
-        );
-      }
+      const finalData = normalizeAIData(
+        parsed,
+        searchResults
+      );
 
       return jsonResponse(
-        parsedData,
+        finalData,
         200,
-        corsHeaders
+        headers
       );
 
     } catch (error) {
       return jsonResponse(
         {
-          error: "Cloudflare AI request failed.",
+          error: "Internet search or AI processing failed.",
           details: error?.message || "Unknown error"
         },
         502,
-        corsHeaders
+        headers
       );
     }
   }
