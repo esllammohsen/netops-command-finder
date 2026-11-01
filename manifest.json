@@ -1,0 +1,17 @@
+{
+  "name": "NetOps Command Finder",
+  "short_name": "NetOps",
+  "description": "Offline command finder for F5, PaloAlto, FortiGate, FTD/FMC, Switch, SD-WAN, Router, and ACI.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#f2f2f2",
+  "theme_color": "#1d3450",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
