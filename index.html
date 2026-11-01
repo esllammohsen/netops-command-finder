@@ -484,6 +484,24 @@
   }
   body.dark .expl{ color:#bbb; }
   body.dark .empty{ color:#888; }
+  .web-panel{margin-top:18px;border:1px solid var(--border);border-radius:7px;background:#fff;padding:14px;}
+  .web-panel h2{font-size:16px;margin:0 0 8px;color:var(--accent-dark)}
+  .web-status{font-size:12px;color:#666;margin:6px 0 12px;}
+  .web-card{border-top:1px solid var(--border);padding:12px 0;}
+  .web-card:first-of-type{border-top:0;}
+  .web-card h3{font-size:14px;margin:0 0 7px;}
+  .web-card p{margin:5px 0;line-height:1.55;}
+  .web-command{background:#f4f6f8;border:1px solid #e0e4e8;border-radius:5px;padding:9px;margin:7px 0;font-family:Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;}
+  .web-source{font-size:12px;display:inline-block;margin:5px 8px 0 0;}
+  .web-tag{display:inline-block;background:#eaf1f8;color:#24496d;padding:3px 7px;border-radius:10px;font-size:11px;margin:0 5px 5px 0;}
+  .web-warning{font-size:12px;color:#875b13;background:#fff7e5;border:1px solid #f0dfb8;border-radius:5px;padding:8px;margin-top:8px;}
+  body.dark .web-panel{background:#24282e;border-color:#444;}
+  body.dark .web-panel h2{color:#c8ddf1;}
+  body.dark .web-status{color:#aaa;}
+  body.dark .web-card{border-color:#444;}
+  body.dark .web-command{background:#1d2228;border-color:#444;color:#eee;}
+  body.dark .web-tag{background:#26394d;color:#c8ddf1;}
+  body.dark .web-warning{background:#3a3020;border-color:#66512c;color:#f1d59b;}
   body.dark footer,
   body.dark footer.dbfoot{
     color:#777;
@@ -505,7 +523,7 @@
     <div class="vendor-grid" id="topOptions"></div>
     <button class="install-app-btn" style="display:none;margin-top:18px;width:100%;">Install App</button>
     <div class="ios-install-hint">On iPhone/iPad: tap Share, then "Add to Home Screen" to install.</div>
-    <footer>works offline once installed — no internet or API required</footer>
+    <footer>local search works offline; online command discovery requires an internet connection</footer>
   </div>
 </div>
 
@@ -518,7 +536,7 @@
     <h1 id="vendorScreenTitle">Choose a Device</h1>
     <div class="sub" id="vendorScreenSub">Search the commands for the device you're working on by describing your issue</div>
     <div class="vendor-grid" id="vendorOptions"></div>
-    <footer>works fully offline — no internet or API required</footer>
+    <footer>local command search works offline; online discovery requires an internet connection</footer>
   </div>
 </div>
 
@@ -546,7 +564,13 @@
       <div class="empty">Describe the issue above and start searching</div>
     </div>
 
-    <footer class="dbfoot">local database: <span id="dbCount"></span> commands — smart local search, no internet required</footer>
+    <section class="web-panel" id="webPanel">
+      <h2>Internet Command Discovery</h2>
+      <div class="web-status" id="webStatus">Online discovery will search for additional commands from vendor documentation and trusted technical sources when you press Search.</div>
+      <div id="webResults"></div>
+    </section>
+
+    <footer class="dbfoot">local database: <span id="dbCount"></span> commands + live internet command discovery</footer>
   </div>
 </div>
 
@@ -926,8 +950,62 @@ function renderRecentSearches(){
 }
 
 var searchDebounceTimer = null;
+// Paste your deployed Cloudflare Worker URL here. Never put API keys in this file.
+const SMART_WEB_SEARCH_ENDPOINT = "https://shiny-river-ca4b.esllammohsen11.workers.dev/search";
 
-function runSearch(){
+function renderWebDiscovery(data){
+  var status = document.getElementById("webStatus");
+  var box = document.getElementById("webResults");
+  var html = "";
+  if(data.summary) html += '<p>' + escapeHtml(data.summary) + '</p>';
+  if(Array.isArray(data.causes) && data.causes.length){
+    html += '<h3>Possible causes</h3>' + data.causes.map(function(c){
+      return '<div class="web-card"><b>' + escapeHtml(c.title || "Possible cause") + '</b><p>' + escapeHtml(c.detail || "") + '</p></div>';
+    }).join("");
+  }
+  if(Array.isArray(data.commands) && data.commands.length){
+    html += '<h3>New commands found online</h3>' + data.commands.map(function(c){
+      var source = c.source_url ? '<a class="web-source" href="' + escapeHtml(c.source_url) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(c.source_title || "View source") + '</a>' : '';
+      return '<div class="web-card"><div><span class="web-tag">' + escapeHtml(c.platform || "Vendor") + '</span>' + (c.risk ? '<span class="web-tag">Risk: ' + escapeHtml(c.risk) + '</span>' : '') + '</div>' +
+        '<div class="web-command">' + escapeHtml(c.command || "") + '</div><p><b>What it does:</b> ' + escapeHtml(c.description || "") + '</p><p><b>When to use:</b> ' + escapeHtml(c.when_to_use || "") + '</p>' + source + '</div>';
+    }).join("");
+  }
+  if(Array.isArray(data.sources) && data.sources.length){
+    html += '<h3>Sources</h3>' + data.sources.map(function(s){
+      if(!s.url) return '';
+      return '<a class="web-source" href="' + escapeHtml(s.url) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(s.title || s.url) + '</a>';
+    }).join("");
+  }
+  if(data.safety_note) html += '<div class="web-warning">' + escapeHtml(data.safety_note) + '</div>';
+  if(!html) html = '<div class="web-status">No additional command results were returned. Try adding the device model, software version, or exact symptom.</div>';
+  box.innerHTML = html;
+  status.textContent = "Internet research completed. Verify commands against your exact platform and software version before execution.";
+}
+
+async function runInternetDiscovery(query, vendor){
+  var status = document.getElementById("webStatus");
+  var box = document.getElementById("webResults");
+  box.innerHTML = "";
+  if(!SMART_WEB_SEARCH_ENDPOINT){
+    status.textContent = "Internet search is not connected yet. Deploy the included Cloudflare Worker, then add its URL to SMART_WEB_SEARCH_ENDPOINT in index.html.";
+    return;
+  }
+  status.textContent = "Searching vendor documentation and trusted technical sources…";
+  try{
+    var response = await fetch(SMART_WEB_SEARCH_ENDPOINT, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({query:query, vendor:vendor})
+    });
+    var payload = await response.json();
+    if(!response.ok) throw new Error(payload.error || "Search service returned HTTP " + response.status);
+    renderWebDiscovery(payload);
+  }catch(err){
+    status.textContent = "Internet search could not complete: " + (err.message || "network error") + ". Local command search is still available.";
+  }
+}
+
+function runSearch(includeInternet){
   var q = document.getElementById("q").value.trim();
   var cat = document.getElementById("cat").value;
 
@@ -939,6 +1017,8 @@ function runSearch(){
   if(!q){
     renderRecentSearches();
     document.getElementById("meta").textContent = "";
+    document.getElementById("webStatus").textContent = "Describe an issue and press Search to discover additional commands online.";
+    document.getElementById("webResults").innerHTML = "";
     return;
   }
 
@@ -953,17 +1033,19 @@ function runSearch(){
         escapeHtml(suggestion) + '">' + escapeHtml(suggestion) + '</button>?</div>';
       box.querySelector(".suggest-btn").addEventListener("click", function(){
         document.getElementById("q").value = suggestion;
-        runSearch();
+        runSearch(true);
       });
     } else {
       box.innerHTML = '<div class="empty">No close match found in this device database. Try describing the symptom differently or clear the category filter.</div>';
     }
     document.getElementById("meta").textContent = "";
+    if(includeInternet) runInternetDiscovery(q, currentVendor);
     return;
   }
 
   render(results, tokens);
   if(q.length >= 3) saveRecentSearch(q);
+  if(includeInternet) runInternetDiscovery(q, currentVendor);
 }
 
 function selectVendor(vendor){
@@ -1130,10 +1212,10 @@ function buildVendorScreen(category){
   }
 }
 
-document.getElementById("searchBtn").addEventListener("click", runSearch);
+document.getElementById("searchBtn").addEventListener("click", function(){ runSearch(true); });
 document.getElementById("q").addEventListener("input", function(){
   clearTimeout(searchDebounceTimer);
-  searchDebounceTimer = setTimeout(runSearch, 350);
+  searchDebounceTimer = setTimeout(function(){ runSearch(false); }, 350);
 });
 document.getElementById("q").addEventListener("keydown", function(e){
   if(e.key === "Enter" && !e.shiftKey){
