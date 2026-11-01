@@ -1,3 +1,5 @@
 name = "shiny-river-ca4b"
 main = "worker.js"
 compatibility_date = "2026-11-01"
+[vars]
+GEMINI_MODEL = "gemini-3.8-flash"
