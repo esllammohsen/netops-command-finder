@@ -1,7 +1,18 @@
+
 name = "shiny-river-ca4b"
 main = "worker.js"
 compatibility_date = "2026-11-01"
+
 [vars]
 GEMINI_MODEL = "gemini-3.8-flash"
+ALLOWED_ORIGINS = "https://esllammohsen.github.io"
+ACCESS_TEAM_DOMAIN = "YOUR_TEAM.cloudflareaccess.com"
+ACCESS_AUD = "YOUR_ACCESS_APPLICATION_AUD"
+
 [ai]
 binding = "AI"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "netops-command-db"
+database_id = "379ff1d3-8edd-4aa5-b2a4-8addc5a28341"
